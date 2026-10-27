@@ -1,0 +1,19 @@
+[build]
+  command = "vite build"
+  publish = "dist/client"
+
+# Public, non-secret settings only. Set VITE_API_BASE_URL in the Netlify UI
+# (Project configuration → Environment variables). Never add AWS credentials here.
+
+[dev]
+  command = "npm run dev"
+  targetPort = 3000
+  port = 8888
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "DENY"
+    Referrer-Policy = "strict-origin-when-cross-origin"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"

@@ -1,0 +1,200 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  File Converter Physical Drop Box — private S3 buckets, API + converter Lambdas,
+  DynamoDB job table and an HTTP API. No S3 event triggers (no recursion risk).
+
+Parameters:
+  AllowedOrigin:
+    Type: String
+    Default: '*'
+    Description: Netlify site origin allowed by CORS, e.g. https://your-site.netlify.app (use * only for testing).
+  ExistingRoleArn:
+    Type: String
+    Default: ''
+    Description: >
+      Optional existing Lambda execution role (e.g. arn:aws:iam::123456789012:role/LabRole).
+      Leave empty to create two least-privilege roles.
+  MaxUploadBytes:
+    Type: Number
+    Default: 10485760
+    Description: Server-side upload limit in bytes (keep in sync with VITE_MAX_UPLOAD_MB).
+  EnabledConversions:
+    Type: String
+    Default: TXT_TO_UPPERCASE,CSV_TO_JSON,PNG_TO_JPEG
+    Description: Conversions advertised by GET /capabilities.
+
+Conditions:
+  CreateRoles: !Equals [!Ref ExistingRoleArn, '']
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [x86_64]
+    Environment:
+      Variables:
+        INPUT_BUCKET: !Ref UploadsBucket
+        OUTPUT_BUCKET: !Ref OutputBucket
+        JOBS_TABLE: !Ref JobsTable
+        MAX_UPLOAD_BYTES: !Ref MaxUploadBytes
+
+Resources:
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
+      LifecycleConfiguration:
+        Rules: [{ Id: expire-uploads, Status: Enabled, ExpirationInDays: 7 }]
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [POST]
+            AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+
+  OutputBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration: { BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true }
+      OwnershipControls: { Rules: [{ ObjectOwnership: BucketOwnerEnforced }] }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration: [{ ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 } }]
+      LifecycleConfiguration:
+        Rules: [{ Id: expire-outputs, Status: Enabled, ExpirationInDays: 7 }]
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET]
+            AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedHeaders: ['*']
+            MaxAge: 3000
+
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: jobId, AttributeType: S }
+        - { AttributeName: entity, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: jobId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: byCreatedAt
+          KeySchema:
+            - { AttributeName: entity, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  # ---------- Least-privilege roles (only when ExistingRoleArn is empty) ----------
+  ApiRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: file-converter-api
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetObject]   # PutObject signs the presigned POST; GetObject covers HeadObject
+                Resource: !Sub '${UploadsBucket.Arn}/uploads/*'
+              - Effect: Allow
+                Action: [s3:GetObject]                 # signs presigned download URLs
+                Resource: !Sub '${OutputBucket.Arn}/converted/*'
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt JobsTable.Arn
+              - Effect: Allow
+                Action: [dynamodb:Query]
+                Resource: !Sub '${JobsTable.Arn}/index/byCreatedAt'
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource: !GetAtt ConverterFunction.Arn
+
+  ConverterRole:
+    Type: AWS::IAM::Role
+    Condition: CreateRoles
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{ Effect: Allow, Principal: { Service: lambda.amazonaws.com }, Action: sts:AssumeRole }]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole]
+      Policies:
+        - PolicyName: file-converter-worker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject]
+                Resource: !Sub '${UploadsBucket.Arn}/uploads/*'
+              - Effect: Allow
+                Action: [s3:PutObject]
+                Resource: !Sub '${OutputBucket.Arn}/converted/*'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+                Resource: !GetAtt JobsTable.Arn
+
+  # ---------- Functions ----------
+  ConverterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/converter/
+      Handler: index.handler
+      MemorySize: 1024
+      Timeout: 60
+      Role: !If [CreateRoles, !GetAtt ConverterRole.Arn, !Ref ExistingRoleArn]
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0   # failures are recorded in DynamoDB instead of retried
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: lambdas/api/
+      Handler: index.handler
+      MemorySize: 256
+      Timeout: 15
+      Role: !If [CreateRoles, !GetAtt ApiRole.Arn, !Ref ExistingRoleArn]
+      Environment:
+        Variables:
+          CONVERTER_FUNCTION_NAME: !Ref ConverterFunction
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+          ENABLED_CONVERSIONS: !Ref EnabledConversions
+          UPLOAD_URL_TTL: '300'
+          DOWNLOAD_URL_TTL: '300'
+      Events:
+        Capabilities: { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: /capabilities, Method: GET } }
+        CreateJob:    { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: /jobs, Method: POST } }
+        ListJobs:     { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: /jobs, Method: GET } }
+        GetJob:       { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/jobs/{jobId}', Method: GET } }
+        Convert:      { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/jobs/{jobId}/convert', Method: POST } }
+        Download:     { Type: HttpApi, Properties: { ApiId: !Ref HttpApi, Path: '/jobs/{jobId}/download', Method: GET } }
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigin]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [Content-Type]
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+Outputs:
+  ApiBaseUrl:
+    Description: Set this as VITE_API_BASE_URL in Netlify
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+  UploadsBucketName:
+    Value: !Ref UploadsBucket
+  OutputBucketName:
+    Value: !Ref OutputBucket
+  JobsTableName:
+    Value: !Ref JobsTable

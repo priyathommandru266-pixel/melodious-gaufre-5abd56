@@ -1,0 +1,41 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "PresignUploadsAndVerifyObject",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::UPLOADS_BUCKET_NAME/uploads/*"
+    },
+    {
+      "Sid": "PresignDownloads",
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": "arn:aws:s3:::OUTPUT_BUCKET_NAME/converted/*"
+    },
+    {
+      "Sid": "JobRecords",
+      "Effect": "Allow",
+      "Action": ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"],
+      "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/JOBS_TABLE_NAME"
+    },
+    {
+      "Sid": "ListHistory",
+      "Effect": "Allow",
+      "Action": ["dynamodb:Query"],
+      "Resource": "arn:aws:dynamodb:REGION:ACCOUNT_ID:table/JOBS_TABLE_NAME/index/byCreatedAt"
+    },
+    {
+      "Sid": "StartConverter",
+      "Effect": "Allow",
+      "Action": ["lambda:InvokeFunction"],
+      "Resource": "arn:aws:lambda:REGION:ACCOUNT_ID:function:CONVERTER_FUNCTION_NAME"
+    },
+    {
+      "Sid": "Logs",
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:REGION:ACCOUNT_ID:*"
+    }
+  ]
+}
